@@ -2,12 +2,153 @@ from fastapi import FastAPI, HTTPException
 from sqlalchemy import text
 from uuid import uuid4
 import nflreadpy as nfl
-from datetime import datetime
-
+from datetime import datetime, timezone
 from app.db import engine, SessionLocal
 
 app = FastAPI()
 
+def get_game_count_for_week(db, week_id: str) -> int:
+    result = db.execute(
+        text("""
+            select count(*) as game_count
+            from games
+            where week_id = :week_id
+        """),
+        {"week_id": week_id}
+    ).fetchone()
+
+    return int(result.game_count)
+
+def get_allowed_confidence_values(game_count: int) -> list[int]:
+    min_confidence = 17 - game_count
+    max_confidence = 16
+    return list(range(min_confidence, max_confidence + 1))
+
+def score_pick_row(game_status, winning_team, is_tie, selected_team, confidence_value):
+    """
+    Returns:
+        is_correct, points_awarded, result_bucket
+
+    result_bucket is one of:
+        "correct", "incorrect", "push", "void"
+    """
+    # canceled / void / postponed → no points
+    if game_status in {"void", "cancelled", "postponed"}:
+        return None, 0, "void"
+
+    # tie game → push
+    if is_tie:
+        return None, 0, "push"
+
+    # no final winner yet → not scoreable
+    if winning_team is None:
+        return None, 0, "void"
+
+    # normal scoring
+    if selected_team == winning_team:
+        return True, confidence_value, "correct"
+
+    return False, 0, "incorrect"
+
+def rebuild_season_standings(db, pool_id: str):
+    # wipe existing standings for this pool and rebuild from weekly_scores
+    db.execute(
+        text("""
+            delete from season_standings
+            where pool_id = :pool_id
+        """),
+        {"pool_id": pool_id}
+    )
+
+    db.execute(
+        text("""
+            insert into season_standings (
+                pool_id,
+                user_id,
+                total_points,
+                total_correct_picks,
+                total_incorrect_picks,
+                total_pushed_picks,
+                total_voided_picks,
+                highest_single_week_score
+            )
+            select
+                ws.pool_id,
+                ws.user_id,
+                sum(ws.total_points) as total_points,
+                sum(ws.correct_picks) as total_correct_picks,
+                sum(ws.incorrect_picks) as total_incorrect_picks,
+                sum(ws.pushed_picks) as total_pushed_picks,
+                sum(ws.voided_picks) as total_voided_picks,
+                max(ws.total_points) as highest_single_week_score
+            from weekly_scores ws
+            where ws.pool_id = :pool_id
+            group by ws.pool_id, ws.user_id
+        """),
+        {"pool_id": pool_id}
+    )
+
+    standings = db.execute(
+        text("""
+            select id, user_id, total_points, total_correct_picks, highest_single_week_score
+            from season_standings
+            where pool_id = :pool_id
+            order by
+                total_points desc,
+                total_correct_picks desc,
+                highest_single_week_score desc,
+                user_id asc
+        """),
+        {"pool_id": pool_id}
+    ).fetchall()
+
+    for idx, row in enumerate(standings, start=1):
+        db.execute(
+            text("""
+                update season_standings
+                set current_rank = :rank,
+                    updated_at = now()
+                where id = :id
+            """),
+            {"rank": idx, "id": row.id}
+        )
+
+def is_game_locked(db, game_id: str) -> bool:
+    game = db.execute(
+        text("""
+            select g.kickoff_at, g.week_id
+            from games g
+            where g.id = :game_id
+        """),
+        {"game_id": game_id}
+    ).fetchone()
+
+    if not game:
+        return True
+
+    now = datetime.now(timezone.utc)
+
+    # Rule 1: game locks at kickoff
+    if game.kickoff_at <= now:
+        return True
+
+    # Rule 2: once Sunday 1 PM games start, all remaining games lock
+    sunday_lock = db.execute(
+        text("""
+            select min(g.kickoff_at) as sunday_1pm_lock
+            from games g
+            where g.week_id = :week_id
+              and extract(dow from g.kickoff_at) = 0
+              and extract(hour from g.kickoff_at) = 13
+        """),
+        {"week_id": game.week_id}
+    ).fetchone()
+
+    if sunday_lock and sunday_lock.sunday_1pm_lock:
+        if now >= sunday_lock.sunday_1pm_lock:
+            return True
+
+    return False
 
 @app.get("/")
 def read_root():
@@ -367,9 +508,9 @@ def import_schedule(season_year: int):
 
             week_map[int(week_number)] = week_id
 
-        inserted_games = 0
+        upserted_games = 0
 
-        # --- Insert games ---
+        # --- Insert/update games ---
         for row in df.iter_rows(named=True):
             week_number = int(row["week"])
             week_id = week_map[week_number]
@@ -380,7 +521,6 @@ def import_schedule(season_year: int):
             if gameday is None or gametime is None:
                 continue
 
-            # Normalize time format
             gametime_str = str(gametime)
             if len(gametime_str) == 5:
                 gametime_str = f"{gametime_str}:00"
@@ -401,7 +541,7 @@ def import_schedule(season_year: int):
                 else:
                     is_tie = True
 
-            result = db.execute(
+            db.execute(
                 text("""
                     insert into games (
                         week_id,
@@ -425,8 +565,13 @@ def import_schedule(season_year: int):
                         :winning_team,
                         :is_tie
                     )
-                    on conflict (week_id, away_team, home_team, kickoff_at) do nothing
-                    returning id
+                    on conflict (week_id, away_team, home_team, kickoff_at)
+                    do update set
+                        status = excluded.status,
+                        away_score = excluded.away_score,
+                        home_score = excluded.home_score,
+                        winning_team = excluded.winning_team,
+                        is_tie = excluded.is_tie
                 """),
                 {
                     "week_id": week_id,
@@ -439,10 +584,9 @@ def import_schedule(season_year: int):
                     "winning_team": winning_team,
                     "is_tie": is_tie,
                 }
-            ).fetchone()
+            )
 
-            if result:
-                inserted_games += 1
+            upserted_games += 1
 
         db.commit()
 
@@ -450,11 +594,649 @@ def import_schedule(season_year: int):
             "status": "import complete",
             "season_year": season_year,
             "weeks_created_or_found": len(week_map),
-            "games_inserted": inserted_games,
+            "games_upserted": upserted_games,
         }
 
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        db.close()
+        
+@app.post("/pools/{pool_id}/weeks/{week_id}/submissions")
+def create_submission(pool_id: str, week_id: str, user_id: str):
+    db = SessionLocal()
+    try:
+        # Ensure user is a member of the pool
+        member = db.execute(
+            text("""
+                select 1
+                from pool_members
+                where pool_id = :pool_id
+                  and user_id = :user_id
+            """),
+            {"pool_id": pool_id, "user_id": user_id}
+        ).fetchone()
+
+        if not member:
+            raise HTTPException(status_code=400, detail="User is not a member of this pool")
+
+        # Ensure week exists
+        week = db.execute(
+            text("""
+                select id
+                from weeks
+                where id = :week_id
+            """),
+            {"week_id": week_id}
+        ).fetchone()
+
+        if not week:
+            raise HTTPException(status_code=404, detail="Week not found")
+
+        existing = db.execute(
+            text("""
+                select id, pool_id, user_id, week_id, status, submitted_at
+                from submissions
+                where pool_id = :pool_id
+                  and user_id = :user_id
+                  and week_id = :week_id
+            """),
+            {
+                "pool_id": pool_id,
+                "user_id": user_id,
+                "week_id": week_id
+            }
+        ).fetchone()
+
+        if existing:
+            return {
+                "id": str(existing.id),
+                "pool_id": str(existing.pool_id),
+                "user_id": str(existing.user_id),
+                "week_id": str(existing.week_id),
+                "status": existing.status,
+                "submitted_at": existing.submitted_at.isoformat() if existing.submitted_at else None
+            }
+
+        created = db.execute(
+            text("""
+                insert into submissions (pool_id, user_id, week_id)
+                values (:pool_id, :user_id, :week_id)
+                returning id, pool_id, user_id, week_id, status, submitted_at
+            """),
+            {
+                "pool_id": pool_id,
+                "user_id": user_id,
+                "week_id": week_id
+            }
+        ).fetchone()
+
+        db.commit()
+
+        return {
+            "id": str(created.id),
+            "pool_id": str(created.pool_id),
+            "user_id": str(created.user_id),
+            "week_id": str(created.week_id),
+            "status": created.status,
+            "submitted_at": created.submitted_at.isoformat() if created.submitted_at else None
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        db.close()
+        
+@app.post("/submissions/{submission_id}/picks")
+def save_pick(
+    submission_id: str,
+    game_id: str,
+    selected_team: str,
+    confidence_value: int
+):
+    db = SessionLocal()
+    try:
+        submission = db.execute(
+            text("""
+                select id, week_id, status
+                from submissions
+                where id = :submission_id
+            """),
+            {"submission_id": submission_id}
+        ).fetchone()
+
+        if not submission:
+            raise HTTPException(status_code=404, detail="Submission not found")
+
+        if submission.status == "submitted":
+            raise HTTPException(status_code=400, detail="Submission already submitted")
+
+        game = db.execute(
+            text("""
+                select id, week_id, away_team, home_team
+                from games
+                where id = :game_id
+            """),
+            {"game_id": game_id}
+        ).fetchone()
+
+        if not game:
+            raise HTTPException(status_code=404, detail="Game not found")
+
+        if str(game.week_id) != str(submission.week_id):
+            raise HTTPException(status_code=400, detail="Game does not belong to submission week")
+
+        if is_game_locked(db, game_id):
+            raise HTTPException(
+                status_code=400,
+                detail="This game is locked and cannot be edited"
+            )
+
+        if selected_team not in {game.away_team, game.home_team}:
+            raise HTTPException(
+                status_code=400,
+                detail=f"selected_team must be one of: {game.away_team}, {game.home_team}"
+            )
+
+        game_count = get_game_count_for_week(db, str(submission.week_id))
+        allowed_values = get_allowed_confidence_values(game_count)
+
+        if confidence_value not in allowed_values:
+            raise HTTPException(
+                status_code=400,
+                detail=f"confidence_value must be in {allowed_values}"
+            )
+
+        existing_pick = db.execute(
+            text("""
+                select id
+                from picks
+                where submission_id = :submission_id
+                  and game_id = :game_id
+            """),
+            {
+                "submission_id": submission_id,
+                "game_id": game_id
+            }
+        ).fetchone()
+
+        if existing_pick:
+            db.execute(
+                text("""
+                    update picks
+                    set selected_team = :selected_team,
+                        confidence_value = :confidence_value,
+                        updated_at = now()
+                    where id = :pick_id
+                """),
+                {
+                    "pick_id": existing_pick.id,
+                    "selected_team": selected_team,
+                    "confidence_value": confidence_value
+                }
+            )
+        else:
+            db.execute(
+                text("""
+                    insert into picks (submission_id, game_id, selected_team, confidence_value)
+                    values (:submission_id, :game_id, :selected_team, :confidence_value)
+                """),
+                {
+                    "submission_id": submission_id,
+                    "game_id": game_id,
+                    "selected_team": selected_team,
+                    "confidence_value": confidence_value
+                }
+            )
+
+        db.commit()
+
+        return {
+            "message": "pick saved",
+            "submission_id": submission_id,
+            "game_id": game_id,
+            "selected_team": selected_team,
+            "confidence_value": confidence_value
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        error_text = str(e)
+
+        if "picks_submission_id_confidence_value_key" in error_text:
+            raise HTTPException(status_code=400, detail="Confidence value already used in this submission")
+
+        if "picks_submission_id_game_id_key" in error_text:
+            raise HTTPException(status_code=400, detail="Game already has a pick in this submission")
+
+        raise HTTPException(status_code=400, detail=error_text)
+    finally:
+        db.close()
+        
+@app.get("/pools/{pool_id}/weeks/{week_id}/submissions/{user_id}")
+def get_submission(pool_id: str, week_id: str, user_id: str):
+    db = SessionLocal()
+    try:
+        submission = db.execute(
+            text("""
+                select id, pool_id, user_id, week_id, status, submitted_at
+                from submissions
+                where pool_id = :pool_id
+                  and week_id = :week_id
+                  and user_id = :user_id
+            """),
+            {
+                "pool_id": pool_id,
+                "week_id": week_id,
+                "user_id": user_id
+            }
+        ).fetchone()
+
+        if not submission:
+            raise HTTPException(status_code=404, detail="Submission not found")
+
+        picks_result = db.execute(
+            text("""
+                select
+                    p.id,
+                    p.game_id,
+                    p.selected_team,
+                    p.confidence_value,
+                    g.away_team,
+                    g.home_team,
+                    g.kickoff_at
+                from picks p
+                join games g on p.game_id = g.id
+                where p.submission_id = :submission_id
+                order by g.kickoff_at asc, g.away_team asc, g.home_team asc
+            """),
+            {"submission_id": submission.id}
+        )
+
+        picks = []
+        for row in picks_result:
+            picks.append({
+                "id": str(row.id),
+                "game_id": str(row.game_id),
+                "selected_team": row.selected_team,
+                "confidence_value": row.confidence_value,
+                "away_team": row.away_team,
+                "home_team": row.home_team,
+                "kickoff_at": row.kickoff_at.isoformat()
+            })
+
+        game_count = get_game_count_for_week(db, week_id)
+        allowed_values = get_allowed_confidence_values(game_count)
+
+        return {
+            "submission": {
+                "id": str(submission.id),
+                "pool_id": str(submission.pool_id),
+                "user_id": str(submission.user_id),
+                "week_id": str(submission.week_id),
+                "status": submission.status,
+                "submitted_at": submission.submitted_at.isoformat() if submission.submitted_at else None
+            },
+            "game_count": game_count,
+            "allowed_confidence_values": allowed_values,
+            "picks": picks
+        }
+
+    finally:
+        db.close()
+        
+@app.post("/submissions/{submission_id}/submit")
+def submit_submission(submission_id: str):
+    db = SessionLocal()
+    try:
+        submission = db.execute(
+            text("""
+                select id, week_id, status
+                from submissions
+                where id = :submission_id
+            """),
+            {"submission_id": submission_id}
+        ).fetchone()
+
+        if not submission:
+            raise HTTPException(status_code=404, detail="Submission not found")
+
+        if submission.status == "submitted":
+            raise HTTPException(status_code=400, detail="Submission already submitted")
+
+        # Once any game in the week has started, no submission allowed
+        lock_check = db.execute(
+            text("""
+                select 1
+                from games
+                where week_id = :week_id
+                  and kickoff_at <= now()
+                limit 1
+            """),
+            {"week_id": submission.week_id}
+        ).fetchone()
+
+        if lock_check:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot submit after games have started"
+            )
+
+        game_count = get_game_count_for_week(db, str(submission.week_id))
+        allowed_values = set(get_allowed_confidence_values(game_count))
+
+        picks_result = db.execute(
+            text("""
+                select game_id, confidence_value
+                from picks
+                where submission_id = :submission_id
+            """),
+            {"submission_id": submission_id}
+        )
+
+        picks = picks_result.fetchall()
+
+        if len(picks) != game_count:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Submission must contain picks for all {game_count} games"
+            )
+
+        used_game_ids = {str(row.game_id) for row in picks}
+        if len(used_game_ids) != game_count:
+            raise HTTPException(status_code=400, detail="Duplicate game picks detected")
+
+        used_confidence_values = {row.confidence_value for row in picks}
+        if used_confidence_values != allowed_values:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Submission must use each confidence value exactly once: {sorted(allowed_values)}"
+            )
+
+        db.execute(
+            text("""
+                update submissions
+                set status = 'submitted',
+                    submitted_at = now(),
+                    updated_at = now()
+                where id = :submission_id
+            """),
+            {"submission_id": submission_id}
+        )
+
+        db.commit()
+
+        return {
+            "message": "submission submitted",
+            "submission_id": submission_id,
+            "game_count": game_count,
+            "confidence_values_used": sorted(list(used_confidence_values))
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        db.close()
+        
+@app.post("/admin/pools/{pool_id}/weeks/{week_id}/score")
+def score_week(pool_id: str, week_id: str):
+    db = SessionLocal()
+    try:
+        submissions = db.execute(
+            text("""
+                select id, user_id
+                from submissions
+                where pool_id = :pool_id
+                  and week_id = :week_id
+                  and status = 'submitted'
+            """),
+            {"pool_id": pool_id, "week_id": week_id}
+        ).fetchall()
+
+        if not submissions:
+            raise HTTPException(status_code=404, detail="No submitted submissions found for this pool/week")
+
+        # reset existing weekly scores for this pool/week
+        db.execute(
+            text("""
+                delete from weekly_scores
+                where pool_id = :pool_id
+                  and week_id = :week_id
+            """),
+            {"pool_id": pool_id, "week_id": week_id}
+        )
+
+        scored_users = 0
+
+        for submission in submissions:
+            picks = db.execute(
+                text("""
+                    select
+                        p.id as pick_id,
+                        p.selected_team,
+                        p.confidence_value,
+                        g.status as game_status,
+                        g.winning_team,
+                        g.is_tie
+                    from picks p
+                    join games g on p.game_id = g.id
+                    where p.submission_id = :submission_id
+                """),
+                {"submission_id": submission.id}
+            ).fetchall()
+
+            correct_picks = 0
+            incorrect_picks = 0
+            pushed_picks = 0
+            voided_picks = 0
+            total_points = 0
+
+            for pick in picks:
+                is_correct, points_awarded, bucket = score_pick_row(
+                    pick.game_status,
+                    pick.winning_team,
+                    pick.is_tie,
+                    pick.selected_team,
+                    pick.confidence_value
+                )
+
+                if bucket == "correct":
+                    correct_picks += 1
+                elif bucket == "incorrect":
+                    incorrect_picks += 1
+                elif bucket == "push":
+                    pushed_picks += 1
+                elif bucket == "void":
+                    voided_picks += 1
+
+                total_points += points_awarded
+
+                db.execute(
+                    text("""
+                        update picks
+                        set is_correct = :is_correct,
+                            points_awarded = :points_awarded,
+                            updated_at = now()
+                        where id = :pick_id
+                    """),
+                    {
+                        "pick_id": pick.pick_id,
+                        "is_correct": is_correct,
+                        "points_awarded": points_awarded
+                    }
+                )
+
+            db.execute(
+                text("""
+                    insert into weekly_scores (
+                        pool_id,
+                        user_id,
+                        week_id,
+                        correct_picks,
+                        incorrect_picks,
+                        pushed_picks,
+                        voided_picks,
+                        total_points
+                    )
+                    values (
+                        :pool_id,
+                        :user_id,
+                        :week_id,
+                        :correct_picks,
+                        :incorrect_picks,
+                        :pushed_picks,
+                        :voided_picks,
+                        :total_points
+                    )
+                """),
+                {
+                    "pool_id": pool_id,
+                    "user_id": submission.user_id,
+                    "week_id": week_id,
+                    "correct_picks": correct_picks,
+                    "incorrect_picks": incorrect_picks,
+                    "pushed_picks": pushed_picks,
+                    "voided_picks": voided_picks,
+                    "total_points": total_points
+                }
+            )
+
+            scored_users += 1
+
+        # assign weekly ranks
+        weekly_rows = db.execute(
+            text("""
+                select id, user_id, total_points, correct_picks
+                from weekly_scores
+                where pool_id = :pool_id
+                  and week_id = :week_id
+                order by
+                    total_points desc,
+                    correct_picks desc,
+                    user_id asc
+            """),
+            {"pool_id": pool_id, "week_id": week_id}
+        ).fetchall()
+
+        for idx, row in enumerate(weekly_rows, start=1):
+            db.execute(
+                text("""
+                    update weekly_scores
+                    set weekly_rank = :rank,
+                        updated_at = now()
+                    where id = :id
+                """),
+                {"rank": idx, "id": row.id}
+            )
+
+        rebuild_season_standings(db, pool_id)
+
+        db.commit()
+
+        return {
+            "message": "week scored",
+            "pool_id": pool_id,
+            "week_id": week_id,
+            "users_scored": scored_users
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        db.close()
+        
+@app.get("/pools/{pool_id}/weeks/{week_id}/leaderboard")
+def get_weekly_leaderboard(pool_id: str, week_id: str):
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            text("""
+                select
+                    ws.weekly_rank,
+                    ws.user_id,
+                    u.display_name,
+                    ws.total_points,
+                    ws.correct_picks,
+                    ws.incorrect_picks,
+                    ws.pushed_picks,
+                    ws.voided_picks
+                from weekly_scores ws
+                join users u on ws.user_id = u.id
+                where ws.pool_id = :pool_id
+                  and ws.week_id = :week_id
+                order by ws.weekly_rank asc, u.display_name asc
+            """),
+            {"pool_id": pool_id, "week_id": week_id}
+        ).fetchall()
+
+        return [
+            {
+                "weekly_rank": row.weekly_rank,
+                "user_id": str(row.user_id),
+                "display_name": row.display_name,
+                "total_points": row.total_points,
+                "correct_picks": row.correct_picks,
+                "incorrect_picks": row.incorrect_picks,
+                "pushed_picks": row.pushed_picks,
+                "voided_picks": row.voided_picks
+            }
+            for row in rows
+        ]
+
+    finally:
+        db.close()
+        
+@app.get("/pools/{pool_id}/standings")
+def get_season_standings(pool_id: str):
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            text("""
+                select
+                    ss.current_rank,
+                    ss.user_id,
+                    u.display_name,
+                    ss.total_points,
+                    ss.total_correct_picks,
+                    ss.total_incorrect_picks,
+                    ss.total_pushed_picks,
+                    ss.total_voided_picks,
+                    ss.highest_single_week_score
+                from season_standings ss
+                join users u on ss.user_id = u.id
+                where ss.pool_id = :pool_id
+                order by ss.current_rank asc, u.display_name asc
+            """),
+            {"pool_id": pool_id}
+        ).fetchall()
+
+        return [
+            {
+                "current_rank": row.current_rank,
+                "user_id": str(row.user_id),
+                "display_name": row.display_name,
+                "total_points": row.total_points,
+                "record": f"{row.total_correct_picks}-{row.total_incorrect_picks}",
+                "total_correct_picks": row.total_correct_picks,
+                "total_incorrect_picks": row.total_incorrect_picks,
+                "total_pushed_picks": row.total_pushed_picks,
+                "total_voided_picks": row.total_voided_picks,
+                "highest_single_week_score": row.highest_single_week_score
+            }
+            for row in rows
+        ]
+
     finally:
         db.close()
