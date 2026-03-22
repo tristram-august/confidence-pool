@@ -897,7 +897,7 @@ def submit_submission(submission_id: str):
     try:
         submission = db.execute(
             text("""
-                select id, week_id, status
+                select id, week_id, status, tiebreaker_prediction
                 from submissions
                 where id = :submission_id
             """),
@@ -909,6 +909,12 @@ def submit_submission(submission_id: str):
 
         if submission.status == "submitted":
             raise HTTPException(status_code=400, detail="Submission already submitted")
+
+        if submission.tiebreaker_prediction is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Tiebreaker prediction is required"
+            )
 
         # Once any game in the week has started, no submission allowed
         lock_check = db.execute(
@@ -976,7 +982,8 @@ def submit_submission(submission_id: str):
             "message": "submission submitted",
             "submission_id": submission_id,
             "game_count": game_count,
-            "confidence_values_used": sorted(list(used_confidence_values))
+            "confidence_values_used": sorted(list(used_confidence_values)),
+            "tiebreaker_prediction": submission.tiebreaker_prediction
         }
 
     except HTTPException:
@@ -993,7 +1000,7 @@ def score_week(pool_id: str, week_id: str):
     try:
         submissions = db.execute(
             text("""
-                select id, user_id
+                select id, user_id, tiebreaker_prediction
                 from submissions
                 where pool_id = :pool_id
                   and week_id = :week_id
@@ -1003,7 +1010,27 @@ def score_week(pool_id: str, week_id: str):
         ).fetchall()
 
         if not submissions:
-            raise HTTPException(status_code=404, detail="No submitted submissions found for this pool/week")
+            raise HTTPException(
+                status_code=404,
+                detail="No submitted submissions found for this pool/week"
+            )
+
+        # Find Monday Night Football game for this week
+        mnf_game = db.execute(
+            text("""
+                select id, home_score, away_score
+                from games
+                where week_id = :week_id
+                  and extract(dow from kickoff_at) = 1
+                order by kickoff_at desc
+                limit 1
+            """),
+            {"week_id": week_id}
+        ).fetchone()
+
+        mnf_total = None
+        if mnf_game and mnf_game.home_score is not None and mnf_game.away_score is not None:
+            mnf_total = mnf_game.home_score + mnf_game.away_score
 
         # reset existing weekly scores for this pool/week
         db.execute(
@@ -1112,20 +1139,63 @@ def score_week(pool_id: str, week_id: str):
 
             scored_users += 1
 
-        # assign weekly ranks
-        weekly_rows = db.execute(
-            text("""
-                select id, user_id, total_points, correct_picks
-                from weekly_scores
-                where pool_id = :pool_id
-                  and week_id = :week_id
-                order by
-                    total_points desc,
-                    correct_picks desc,
-                    user_id asc
-            """),
-            {"pool_id": pool_id, "week_id": week_id}
-        ).fetchall()
+        # assign weekly ranks, using MNF tiebreaker if available
+        if mnf_total is not None:
+            weekly_rows = db.execute(
+                text("""
+                    select
+                        ws.id,
+                        ws.user_id,
+                        ws.total_points,
+                        ws.correct_picks,
+                        s.tiebreaker_prediction,
+                        abs(s.tiebreaker_prediction - :mnf_total) as tiebreak_diff
+                    from weekly_scores ws
+                    join submissions s
+                      on s.pool_id = ws.pool_id
+                     and s.user_id = ws.user_id
+                     and s.week_id = ws.week_id
+                    where ws.pool_id = :pool_id
+                      and ws.week_id = :week_id
+                    order by
+                        ws.total_points desc,
+                        ws.correct_picks desc,
+                        abs(s.tiebreaker_prediction - :mnf_total) asc,
+                        ws.user_id asc
+                """),
+                {
+                    "pool_id": pool_id,
+                    "week_id": week_id,
+                    "mnf_total": mnf_total
+                }
+            ).fetchall()
+        else:
+            weekly_rows = db.execute(
+                text("""
+                    select
+                        ws.id,
+                        ws.user_id,
+                        ws.total_points,
+                        ws.correct_picks,
+                        s.tiebreaker_prediction,
+                        null as tiebreak_diff
+                    from weekly_scores ws
+                    join submissions s
+                      on s.pool_id = ws.pool_id
+                     and s.user_id = ws.user_id
+                     and s.week_id = ws.week_id
+                    where ws.pool_id = :pool_id
+                      and ws.week_id = :week_id
+                    order by
+                        ws.total_points desc,
+                        ws.correct_picks desc,
+                        ws.user_id asc
+                """),
+                {
+                    "pool_id": pool_id,
+                    "week_id": week_id
+                }
+            ).fetchall()
 
         for idx, row in enumerate(weekly_rows, start=1):
             db.execute(
@@ -1146,7 +1216,8 @@ def score_week(pool_id: str, week_id: str):
             "message": "week scored",
             "pool_id": pool_id,
             "week_id": week_id,
-            "users_scored": scored_users
+            "users_scored": scored_users,
+            "mnf_total": mnf_total
         }
 
     except HTTPException:
@@ -1161,39 +1232,101 @@ def score_week(pool_id: str, week_id: str):
 def get_weekly_leaderboard(pool_id: str, week_id: str):
     db = SessionLocal()
     try:
-        rows = db.execute(
+        mnf_game = db.execute(
             text("""
-                select
-                    ws.weekly_rank,
-                    ws.user_id,
-                    u.display_name,
-                    ws.total_points,
-                    ws.correct_picks,
-                    ws.incorrect_picks,
-                    ws.pushed_picks,
-                    ws.voided_picks
-                from weekly_scores ws
-                join users u on ws.user_id = u.id
-                where ws.pool_id = :pool_id
-                  and ws.week_id = :week_id
-                order by ws.weekly_rank asc, u.display_name asc
+                select id, home_score, away_score
+                from games
+                where week_id = :week_id
+                  and extract(dow from kickoff_at) = 1
+                order by kickoff_at desc
+                limit 1
             """),
-            {"pool_id": pool_id, "week_id": week_id}
-        ).fetchall()
+            {"week_id": week_id}
+        ).fetchone()
 
-        return [
-            {
-                "weekly_rank": row.weekly_rank,
-                "user_id": str(row.user_id),
-                "display_name": row.display_name,
-                "total_points": row.total_points,
-                "correct_picks": row.correct_picks,
-                "incorrect_picks": row.incorrect_picks,
-                "pushed_picks": row.pushed_picks,
-                "voided_picks": row.voided_picks
-            }
-            for row in rows
-        ]
+        mnf_total = None
+        if mnf_game and mnf_game.home_score is not None and mnf_game.away_score is not None:
+            mnf_total = mnf_game.home_score + mnf_game.away_score
+
+        if mnf_total is not None:
+            rows = db.execute(
+                text("""
+                    select
+                        ws.weekly_rank,
+                        ws.user_id,
+                        u.display_name,
+                        ws.total_points,
+                        ws.correct_picks,
+                        ws.incorrect_picks,
+                        ws.pushed_picks,
+                        ws.voided_picks,
+                        s.tiebreaker_prediction,
+                        abs(s.tiebreaker_prediction - :mnf_total) as tiebreak_diff
+                    from weekly_scores ws
+                    join users u on ws.user_id = u.id
+                    join submissions s
+                      on s.pool_id = ws.pool_id
+                     and s.user_id = ws.user_id
+                     and s.week_id = ws.week_id
+                    where ws.pool_id = :pool_id
+                      and ws.week_id = :week_id
+                    order by ws.weekly_rank asc, u.display_name asc
+                """),
+                {
+                    "pool_id": pool_id,
+                    "week_id": week_id,
+                    "mnf_total": mnf_total
+                }
+            ).fetchall()
+        else:
+            rows = db.execute(
+                text("""
+                    select
+                        ws.weekly_rank,
+                        ws.user_id,
+                        u.display_name,
+                        ws.total_points,
+                        ws.correct_picks,
+                        ws.incorrect_picks,
+                        ws.pushed_picks,
+                        ws.voided_picks,
+                        s.tiebreaker_prediction,
+                        null as tiebreak_diff
+                    from weekly_scores ws
+                    join users u on ws.user_id = u.id
+                    join submissions s
+                      on s.pool_id = ws.pool_id
+                     and s.user_id = ws.user_id
+                     and s.week_id = ws.week_id
+                    where ws.pool_id = :pool_id
+                      and ws.week_id = :week_id
+                    order by ws.weekly_rank asc, u.display_name asc
+                """),
+                {
+                    "pool_id": pool_id,
+                    "week_id": week_id
+                }
+            ).fetchall()
+
+        return {
+            "week_id": week_id,
+            "mnf_total": mnf_total,
+            "leaderboard": [
+                {
+                    "weekly_rank": row.weekly_rank,
+                    "user_id": str(row.user_id),
+                    "display_name": row.display_name,
+                    "total_points": row.total_points,
+                    "correct_picks": row.correct_picks,
+                    "incorrect_picks": row.incorrect_picks,
+                    "pushed_picks": row.pushed_picks,
+                    "voided_picks": row.voided_picks,
+                    "tiebreaker_prediction": row.tiebreaker_prediction,
+                    "tiebreak_diff": row.tiebreak_diff
+                }
+                for row in rows
+            ]
+        }
 
     finally:
         db.close()
@@ -1238,5 +1371,51 @@ def get_season_standings(pool_id: str):
             for row in rows
         ]
 
+    finally:
+        db.close()
+        
+@app.post("/submissions/{submission_id}/tiebreaker")
+def set_tiebreaker(submission_id: str, prediction: int):
+    db = SessionLocal()
+    try:
+        submission = db.execute(
+            text("""
+                select id, status
+                from submissions
+                where id = :submission_id
+            """),
+            {"submission_id": submission_id}
+        ).fetchone()
+
+        if not submission:
+            raise HTTPException(status_code=404, detail="Submission not found")
+
+        if submission.status == "submitted":
+            raise HTTPException(status_code=400, detail="Submission already submitted")
+
+        db.execute(
+            text("""
+                update submissions
+                set tiebreaker_prediction = :prediction,
+                    updated_at = now()
+                where id = :submission_id
+            """),
+            {
+                "submission_id": submission_id,
+                "prediction": prediction
+            }
+        )
+
+        db.commit()
+
+        return {
+            "message": "tiebreaker set",
+            "submission_id": submission_id,
+            "prediction": prediction
+        }
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
     finally:
         db.close()
