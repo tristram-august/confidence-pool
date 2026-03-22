@@ -2,11 +2,14 @@
 
 A custom NFL confidence pool application built with FastAPI and PostgreSQL.
 
-## Features (WIP)
-- User management
-- Pool creation and membership
-- Weekly picks with confidence values
-- Scoring and standings
+## Features implemented
+- NFL schedule ingestion via nflreadpy
+- Pool + membership system
+- Weekly submissions with confidence scoring
+- Game locking based on kickoff and Sunday 1PM rule
+- Scoring engine
+- Weekly leaderboard
+- Season standings
 
 ## Tech Stack
 - FastAPI
