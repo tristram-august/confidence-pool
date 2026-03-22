@@ -4,8 +4,19 @@ from uuid import uuid4
 import nflreadpy as nfl
 from datetime import datetime, timezone
 from app.db import engine, SessionLocal
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DEV_DISABLE_LOCKS = True
 
 def get_game_count_for_week(db, week_id: str) -> int:
     result = db.execute(
@@ -114,6 +125,9 @@ def rebuild_season_standings(db, pool_id: str):
         )
 
 def is_game_locked(db, game_id: str) -> bool:
+    if DEV_DISABLE_LOCKS:
+        return False
+
     game = db.execute(
         text("""
             select g.kickoff_at, g.week_id
@@ -128,11 +142,9 @@ def is_game_locked(db, game_id: str) -> bool:
 
     now = datetime.now(timezone.utc)
 
-    # Rule 1: game locks at kickoff
     if game.kickoff_at <= now:
         return True
 
-    # Rule 2: once Sunday 1 PM games start, all remaining games lock
     sunday_lock = db.execute(
         text("""
             select min(g.kickoff_at) as sunday_1pm_lock
@@ -1417,5 +1429,139 @@ def set_tiebreaker(submission_id: str, prediction: int):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        db.close()
+        
+@app.get("/pools/{pool_id}/weeks/{week_id}/games")
+def get_pool_week_games(pool_id: str, week_id: str, user_id: str | None = None):
+    db = SessionLocal()
+    try:
+        # validate pool exists
+        pool = db.execute(
+            text("""
+                select id, name, season_year
+                from pools
+                where id = :pool_id
+            """),
+            {"pool_id": pool_id}
+        ).fetchone()
+
+        if not pool:
+            raise HTTPException(status_code=404, detail="Pool not found")
+
+        # validate week exists
+        week = db.execute(
+            text("""
+                select id, season_year, week_number, week_type
+                from weeks
+                where id = :week_id
+            """),
+            {"week_id": week_id}
+        ).fetchone()
+
+        if not week:
+            raise HTTPException(status_code=404, detail="Week not found")
+
+        submission_id = None
+        submission_status = None
+        picks_by_game_id = {}
+
+        if user_id:
+            submission = db.execute(
+                text("""
+                    select id, status
+                    from submissions
+                    where pool_id = :pool_id
+                      and week_id = :week_id
+                      and user_id = :user_id
+                """),
+                {
+                    "pool_id": pool_id,
+                    "week_id": week_id,
+                    "user_id": user_id
+                }
+            ).fetchone()
+
+            if submission:
+                submission_id = str(submission.id)
+
+                picks = db.execute(
+                    text("""
+                        select game_id, selected_team, confidence_value
+                        from picks
+                        where submission_id = :submission_id
+                    """),
+                    {"submission_id": submission.id}
+                ).fetchall()
+
+                picks_by_game_id = {
+                    str(row.game_id): {
+                        "selected_team": row.selected_team,
+                        "confidence_value": row.confidence_value
+                    }
+                    for row in picks
+                }
+
+        games = db.execute(
+            text("""
+                select
+                    id,
+                    away_team,
+                    home_team,
+                    kickoff_at,
+                    status,
+                    away_score,
+                    home_score,
+                    winning_team,
+                    is_tie
+                from games
+                where week_id = :week_id
+                order by kickoff_at asc, away_team asc, home_team asc
+            """),
+            {"week_id": week_id}
+        ).fetchall()
+
+        response_games = []
+        for game in games:
+            game_id = str(game.id)
+            existing_pick = picks_by_game_id.get(game_id)
+
+            response_games.append({
+                "game_id": game_id,
+                "away_team": game.away_team,
+                "home_team": game.home_team,
+                "kickoff_at": game.kickoff_at.isoformat() if game.kickoff_at else None,
+                "status": game.status,
+                "away_score": game.away_score,
+                "home_score": game.home_score,
+                "winning_team": game.winning_team,
+                "is_tie": game.is_tie,
+                "is_locked": is_game_locked(db, game_id),
+                "selected_team": existing_pick["selected_team"] if existing_pick else None,
+                "confidence_value": existing_pick["confidence_value"] if existing_pick else None
+            })
+
+        game_count = len(response_games)
+        allowed_confidence_values = get_allowed_confidence_values(game_count)
+
+        return {
+            "pool": {
+                "id": str(pool.id),
+                "name": pool.name,
+                "season_year": pool.season_year
+            },
+            "week": {
+                "id": str(week.id),
+                "season_year": week.season_year,
+                "week_number": week.week_number,
+                "week_type": week.week_type
+            },
+            "submission_id": submission_id,
+            "submission_status": submission_status,
+            "game_count": game_count,
+            "allowed_confidence_values": allowed_confidence_values,
+            "games": response_games
+        }
+
     finally:
         db.close()
