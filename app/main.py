@@ -1,10 +1,14 @@
-from fastapi import FastAPI, HTTPException
-from sqlalchemy import text
-from uuid import uuid4
-import nflreadpy as nfl
 from datetime import datetime, timezone
-from app.db import engine, SessionLocal
+from typing import Optional
+from uuid import uuid4
+
+import nflreadpy as nfl
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, conint
+from sqlalchemy import text
+
+from app.db import SessionLocal, engine
 
 app = FastAPI()
 
@@ -18,22 +22,38 @@ app.add_middleware(
 
 DEV_DISABLE_LOCKS = True
 
+
+class PickPayload(BaseModel):
+    game_id: str
+    selected_team: str
+    confidence_value: int
+
+
+class TiebreakerPayload(BaseModel):
+    # Minimal guardrails; adjust later if you want (some pools use 0-150, etc.)
+    tiebreaker_prediction: conint(ge=0, le=200)
+
+
 def get_game_count_for_week(db, week_id: str) -> int:
     result = db.execute(
-        text("""
+        text(
+            """
             select count(*) as game_count
             from games
             where week_id = :week_id
-        """),
-        {"week_id": week_id}
+        """
+        ),
+        {"week_id": week_id},
     ).fetchone()
 
     return int(result.game_count)
+
 
 def get_allowed_confidence_values(game_count: int) -> list[int]:
     min_confidence = 17 - game_count
     max_confidence = 16
     return list(range(min_confidence, max_confidence + 1))
+
 
 def score_pick_row(game_status, winning_team, is_tie, selected_team, confidence_value):
     """
@@ -43,36 +63,35 @@ def score_pick_row(game_status, winning_team, is_tie, selected_team, confidence_
     result_bucket is one of:
         "correct", "incorrect", "push", "void"
     """
-    # canceled / void / postponed → no points
     if game_status in {"void", "cancelled", "postponed"}:
         return None, 0, "void"
 
-    # tie game → push
     if is_tie:
         return None, 0, "push"
 
-    # no final winner yet → not scoreable
     if winning_team is None:
         return None, 0, "void"
 
-    # normal scoring
     if selected_team == winning_team:
         return True, confidence_value, "correct"
 
     return False, 0, "incorrect"
 
+
 def rebuild_season_standings(db, pool_id: str):
-    # wipe existing standings for this pool and rebuild from weekly_scores
     db.execute(
-        text("""
+        text(
+            """
             delete from season_standings
             where pool_id = :pool_id
-        """),
-        {"pool_id": pool_id}
+        """
+        ),
+        {"pool_id": pool_id},
     )
 
     db.execute(
-        text("""
+        text(
+            """
             insert into season_standings (
                 pool_id,
                 user_id,
@@ -95,12 +114,14 @@ def rebuild_season_standings(db, pool_id: str):
             from weekly_scores ws
             where ws.pool_id = :pool_id
             group by ws.pool_id, ws.user_id
-        """),
-        {"pool_id": pool_id}
+        """
+        ),
+        {"pool_id": pool_id},
     )
 
     standings = db.execute(
-        text("""
+        text(
+            """
             select id, user_id, total_points, total_correct_picks, highest_single_week_score
             from season_standings
             where pool_id = :pool_id
@@ -109,32 +130,38 @@ def rebuild_season_standings(db, pool_id: str):
                 total_correct_picks desc,
                 highest_single_week_score desc,
                 user_id asc
-        """),
-        {"pool_id": pool_id}
+        """
+        ),
+        {"pool_id": pool_id},
     ).fetchall()
 
     for idx, row in enumerate(standings, start=1):
         db.execute(
-            text("""
+            text(
+                """
                 update season_standings
                 set current_rank = :rank,
                     updated_at = now()
                 where id = :id
-            """),
-            {"rank": idx, "id": row.id}
+            """
+            ),
+            {"rank": idx, "id": row.id},
         )
+
 
 def is_game_locked(db, game_id: str) -> bool:
     if DEV_DISABLE_LOCKS:
         return False
 
     game = db.execute(
-        text("""
+        text(
+            """
             select g.kickoff_at, g.week_id
             from games g
             where g.id = :game_id
-        """),
-        {"game_id": game_id}
+        """
+        ),
+        {"game_id": game_id},
     ).fetchone()
 
     if not game:
@@ -146,14 +173,16 @@ def is_game_locked(db, game_id: str) -> bool:
         return True
 
     sunday_lock = db.execute(
-        text("""
+        text(
+            """
             select min(g.kickoff_at) as sunday_1pm_lock
             from games g
             where g.week_id = :week_id
               and extract(dow from g.kickoff_at) = 0
               and extract(hour from g.kickoff_at) = 13
-        """),
-        {"week_id": game.week_id}
+        """
+        ),
+        {"week_id": game.week_id},
     ).fetchone()
 
     if sunday_lock and sunday_lock.sunday_1pm_lock:
@@ -161,6 +190,7 @@ def is_game_locked(db, game_id: str) -> bool:
             return True
 
     return False
+
 
 @app.get("/")
 def read_root():
@@ -188,15 +218,15 @@ def create_user(email: str, display_name: str):
             {
                 "id": user_id,
                 "email": email,
-                "display_name": display_name
-            }
+                "display_name": display_name,
+            },
         )
         db.commit()
 
         return {
             "id": user_id,
             "email": email,
-            "display_name": display_name
+            "display_name": display_name,
         }
     except Exception as e:
         db.rollback()
@@ -219,17 +249,20 @@ def get_users():
 
         users = []
         for row in result:
-            users.append({
-                "id": str(row.id),
-                "email": row.email,
-                "display_name": row.display_name,
-                "created_at": row.created_at.isoformat() if row.created_at else None
-            })
+            users.append(
+                {
+                    "id": str(row.id),
+                    "email": row.email,
+                    "display_name": row.display_name,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                }
+            )
 
         return users
     finally:
         db.close()
-        
+
+
 @app.post("/pools")
 def create_pool(name: str, commissioner_user_id: str, season_year: int):
     db = SessionLocal()
@@ -245,11 +278,10 @@ def create_pool(name: str, commissioner_user_id: str, season_year: int):
                 "id": pool_id,
                 "name": name,
                 "commissioner_user_id": commissioner_user_id,
-                "season_year": season_year
-            }
+                "season_year": season_year,
+            },
         )
 
-        # commissioner is also a member
         db.execute(
             text("""
                 insert into pool_members (pool_id, user_id, role)
@@ -257,8 +289,8 @@ def create_pool(name: str, commissioner_user_id: str, season_year: int):
             """),
             {
                 "pool_id": pool_id,
-                "user_id": commissioner_user_id
-            }
+                "user_id": commissioner_user_id,
+            },
         )
 
         db.commit()
@@ -270,7 +302,8 @@ def create_pool(name: str, commissioner_user_id: str, season_year: int):
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         db.close()
-        
+
+
 @app.post("/pools/{pool_id}/join")
 def join_pool(pool_id: str, user_id: str):
     db = SessionLocal()
@@ -282,8 +315,8 @@ def join_pool(pool_id: str, user_id: str):
             """),
             {
                 "pool_id": pool_id,
-                "user_id": user_id
-            }
+                "user_id": user_id,
+            },
         )
         db.commit()
 
@@ -294,7 +327,8 @@ def join_pool(pool_id: str, user_id: str):
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         db.close()
-        
+
+
 @app.get("/pools/{pool_id}")
 def get_pool(pool_id: str):
     db = SessionLocal()
@@ -305,7 +339,7 @@ def get_pool(pool_id: str):
                 from pools
                 where id = :pool_id
             """),
-            {"pool_id": pool_id}
+            {"pool_id": pool_id},
         ).fetchone()
 
         if not pool:
@@ -318,7 +352,7 @@ def get_pool(pool_id: str):
                 join users u on u.id = pm.user_id
                 where pm.pool_id = :pool_id
             """),
-            {"pool_id": pool_id}
+            {"pool_id": pool_id},
         )
 
         return {
@@ -329,22 +363,23 @@ def get_pool(pool_id: str):
                 {
                     "id": str(row.id),
                     "display_name": row.display_name,
-                    "role": row.role
+                    "role": row.role,
                 }
                 for row in members
-            ]
+            ],
         }
 
     finally:
         db.close()
-        
+
+
 @app.post("/weeks")
 def create_week(
     season_year: int,
     week_number: int,
     week_type: str = "regular",
     start_date: str | None = None,
-    end_date: str | None = None
+    end_date: str | None = None,
 ):
     db = SessionLocal()
     try:
@@ -359,8 +394,8 @@ def create_week(
                 "week_number": week_number,
                 "week_type": week_type,
                 "start_date": start_date,
-                "end_date": end_date
-            }
+                "end_date": end_date,
+            },
         )
         row = result.fetchone()
         db.commit()
@@ -378,13 +413,14 @@ def create_week(
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         db.close()
-        
+
+
 @app.post("/games")
 def create_game(
     week_id: str,
     kickoff_at: str,
     away_team: str,
-    home_team: str
+    home_team: str,
 ):
     db = SessionLocal()
     try:
@@ -398,8 +434,8 @@ def create_game(
                 "week_id": week_id,
                 "kickoff_at": kickoff_at,
                 "away_team": away_team,
-                "home_team": home_team
-            }
+                "home_team": home_team,
+            },
         )
         row = result.fetchone()
         db.commit()
@@ -410,14 +446,15 @@ def create_game(
             "kickoff_at": row.kickoff_at.isoformat(),
             "away_team": row.away_team,
             "home_team": row.home_team,
-            "status": row.status
+            "status": row.status,
         }
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         db.close()
-        
+
+
 @app.get("/weeks/{week_id}/games")
 def get_games_for_week(week_id: str):
     db = SessionLocal()
@@ -428,7 +465,7 @@ def get_games_for_week(week_id: str):
                 from weeks
                 where id = :week_id
             """),
-            {"week_id": week_id}
+            {"week_id": week_id},
         ).fetchone()
 
         if not week:
@@ -442,22 +479,24 @@ def get_games_for_week(week_id: str):
                 where week_id = :week_id
                 order by kickoff_at asc, away_team asc, home_team asc
             """),
-            {"week_id": week_id}
+            {"week_id": week_id},
         )
 
         games = []
         for row in results:
-            games.append({
-                "id": str(row.id),
-                "kickoff_at": row.kickoff_at.isoformat(),
-                "away_team": row.away_team,
-                "home_team": row.home_team,
-                "status": row.status,
-                "away_score": row.away_score,
-                "home_score": row.home_score,
-                "winning_team": row.winning_team,
-                "is_tie": row.is_tie
-            })
+            games.append(
+                {
+                    "id": str(row.id),
+                    "kickoff_at": row.kickoff_at.isoformat(),
+                    "away_team": row.away_team,
+                    "home_team": row.home_team,
+                    "status": row.status,
+                    "away_score": row.away_score,
+                    "home_score": row.home_score,
+                    "winning_team": row.winning_team,
+                    "is_tie": row.is_tie,
+                }
+            )
 
         return {
             "week": {
@@ -468,23 +507,21 @@ def get_games_for_week(week_id: str):
                 "start_date": week.start_date.isoformat() if week.start_date else None,
                 "end_date": week.end_date.isoformat() if week.end_date else None,
             },
-            "games": games
+            "games": games,
         }
     finally:
         db.close()
-        
+
+
 @app.post("/admin/import-schedule/{season_year}")
 def import_schedule(season_year: int):
     db = SessionLocal()
     try:
         df = nfl.load_schedules([season_year])
-
-        # Only regular season
         df = df.filter(df["game_type"] == "REG")
 
         week_map = {}
 
-        # --- Create or fetch weeks ---
         for week_number in sorted(df["week"].unique().to_list()):
             result = db.execute(
                 text("""
@@ -496,7 +533,7 @@ def import_schedule(season_year: int):
                 {
                     "season_year": season_year,
                     "week_number": int(week_number),
-                }
+                },
             ).fetchone()
 
             if result:
@@ -513,7 +550,7 @@ def import_schedule(season_year: int):
                     {
                         "season_year": season_year,
                         "week_number": int(week_number),
-                    }
+                    },
                 ).fetchone()
 
                 week_id = existing.id
@@ -522,7 +559,6 @@ def import_schedule(season_year: int):
 
         upserted_games = 0
 
-        # --- Insert/update games ---
         for row in df.iter_rows(named=True):
             week_number = int(row["week"])
             week_id = week_map[week_number]
@@ -595,7 +631,7 @@ def import_schedule(season_year: int):
                     "home_score": home_score,
                     "winning_team": winning_team,
                     "is_tie": is_tie,
-                }
+                },
             )
 
             upserted_games += 1
@@ -614,12 +650,12 @@ def import_schedule(season_year: int):
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         db.close()
-        
+
+
 @app.post("/pools/{pool_id}/weeks/{week_id}/submissions")
 def create_submission(pool_id: str, week_id: str, user_id: str):
     db = SessionLocal()
     try:
-        # Ensure user is a member of the pool
         member = db.execute(
             text("""
                 select 1
@@ -627,20 +663,19 @@ def create_submission(pool_id: str, week_id: str, user_id: str):
                 where pool_id = :pool_id
                   and user_id = :user_id
             """),
-            {"pool_id": pool_id, "user_id": user_id}
+            {"pool_id": pool_id, "user_id": user_id},
         ).fetchone()
 
         if not member:
             raise HTTPException(status_code=400, detail="User is not a member of this pool")
 
-        # Ensure week exists
         week = db.execute(
             text("""
                 select id
                 from weeks
                 where id = :week_id
             """),
-            {"week_id": week_id}
+            {"week_id": week_id},
         ).fetchone()
 
         if not week:
@@ -657,8 +692,8 @@ def create_submission(pool_id: str, week_id: str, user_id: str):
             {
                 "pool_id": pool_id,
                 "user_id": user_id,
-                "week_id": week_id
-            }
+                "week_id": week_id,
+            },
         ).fetchone()
 
         if existing:
@@ -668,20 +703,22 @@ def create_submission(pool_id: str, week_id: str, user_id: str):
                 "user_id": str(existing.user_id),
                 "week_id": str(existing.week_id),
                 "status": existing.status,
-                "submitted_at": existing.submitted_at.isoformat() if existing.submitted_at else None
+                "submitted_at": existing.submitted_at.isoformat() if existing.submitted_at else None,
             }
 
         created = db.execute(
             text("""
                 insert into submissions (pool_id, user_id, week_id)
                 values (:pool_id, :user_id, :week_id)
+                on conflict (pool_id, user_id, week_id)
+                do update set updated_at = now()
                 returning id, pool_id, user_id, week_id, status, submitted_at
             """),
             {
                 "pool_id": pool_id,
                 "user_id": user_id,
-                "week_id": week_id
-            }
+                "week_id": week_id,
+            },
         ).fetchone()
 
         db.commit()
@@ -692,7 +729,7 @@ def create_submission(pool_id: str, week_id: str, user_id: str):
             "user_id": str(created.user_id),
             "week_id": str(created.week_id),
             "status": created.status,
-            "submitted_at": created.submitted_at.isoformat() if created.submitted_at else None
+            "submitted_at": created.submitted_at.isoformat() if created.submitted_at else None,
         }
 
     except HTTPException:
@@ -702,14 +739,10 @@ def create_submission(pool_id: str, week_id: str, user_id: str):
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         db.close()
-        
+
+
 @app.post("/submissions/{submission_id}/picks")
-def save_pick(
-    submission_id: str,
-    game_id: str,
-    selected_team: str,
-    confidence_value: int
-):
+def save_pick(submission_id: str, payload: PickPayload):
     db = SessionLocal()
     try:
         submission = db.execute(
@@ -718,13 +751,13 @@ def save_pick(
                 from submissions
                 where id = :submission_id
             """),
-            {"submission_id": submission_id}
+            {"submission_id": submission_id},
         ).fetchone()
 
         if not submission:
             raise HTTPException(status_code=404, detail="Submission not found")
 
-        if submission.status == "submitted":
+        if submission.status == "submitted" and not DEV_DISABLE_LOCKS:
             raise HTTPException(status_code=400, detail="Submission already submitted")
 
         game = db.execute(
@@ -733,7 +766,7 @@ def save_pick(
                 from games
                 where id = :game_id
             """),
-            {"game_id": game_id}
+            {"game_id": payload.game_id},
         ).fetchone()
 
         if not game:
@@ -742,77 +775,63 @@ def save_pick(
         if str(game.week_id) != str(submission.week_id):
             raise HTTPException(status_code=400, detail="Game does not belong to submission week")
 
-        if is_game_locked(db, game_id):
-            raise HTTPException(
-                status_code=400,
-                detail="This game is locked and cannot be edited"
-            )
+        if is_game_locked(db, payload.game_id):
+            raise HTTPException(status_code=400, detail="This game is locked and cannot be edited")
 
-        if selected_team not in {game.away_team, game.home_team}:
+        if payload.selected_team not in {game.away_team, game.home_team}:
             raise HTTPException(
                 status_code=400,
-                detail=f"selected_team must be one of: {game.away_team}, {game.home_team}"
+                detail=f"selected_team must be one of: {game.away_team}, {game.home_team}",
             )
 
         game_count = get_game_count_for_week(db, str(submission.week_id))
         allowed_values = get_allowed_confidence_values(game_count)
 
-        if confidence_value not in allowed_values:
+        if payload.confidence_value not in allowed_values:
             raise HTTPException(
                 status_code=400,
-                detail=f"confidence_value must be in {allowed_values}"
+                detail=f"confidence_value must be in {allowed_values}",
             )
-
-        existing_pick = db.execute(
+        db.execute(
             text("""
-                select id
-                from picks
+                delete from picks
                 where submission_id = :submission_id
-                  and game_id = :game_id
+                and confidence_value = :confidence_value
+                and game_id != :game_id
             """),
             {
                 "submission_id": submission_id,
-                "game_id": game_id
-            }
-        ).fetchone()
+                "confidence_value": payload.confidence_value,
+                "game_id": payload.game_id,
+            },
+        )
 
-        if existing_pick:
-            db.execute(
-                text("""
-                    update picks
-                    set selected_team = :selected_team,
-                        confidence_value = :confidence_value,
-                        updated_at = now()
-                    where id = :pick_id
-                """),
-                {
-                    "pick_id": existing_pick.id,
-                    "selected_team": selected_team,
-                    "confidence_value": confidence_value
-                }
-            )
-        else:
-            db.execute(
-                text("""
-                    insert into picks (submission_id, game_id, selected_team, confidence_value)
-                    values (:submission_id, :game_id, :selected_team, :confidence_value)
-                """),
-                {
-                    "submission_id": submission_id,
-                    "game_id": game_id,
-                    "selected_team": selected_team,
-                    "confidence_value": confidence_value
-                }
-            )
+        db.execute(
+            text("""
+                insert into picks (submission_id, game_id, selected_team, confidence_value)
+                values (:submission_id, :game_id, :selected_team, :confidence_value)
+                on conflict (submission_id, game_id)
+                do update set
+                    selected_team = excluded.selected_team,
+                    confidence_value = excluded.confidence_value,
+                    updated_at = now()
+            """),
+            {
+                "submission_id": submission_id,
+                "game_id": payload.game_id,
+                "selected_team": payload.selected_team,
+                "confidence_value": payload.confidence_value,
+            },
+        )
 
         db.commit()
 
         return {
             "message": "pick saved",
             "submission_id": submission_id,
-            "game_id": game_id,
-            "selected_team": selected_team,
-            "confidence_value": confidence_value
+            "game_id": payload.game_id,
+            "selected_team": payload.selected_team,
+            "confidence_value": payload.confidence_value,
         }
 
     except HTTPException:
@@ -830,14 +849,15 @@ def save_pick(
         raise HTTPException(status_code=400, detail=error_text)
     finally:
         db.close()
-        
+
+
 @app.get("/pools/{pool_id}/weeks/{week_id}/submissions/{user_id}")
 def get_submission(pool_id: str, week_id: str, user_id: str):
     db = SessionLocal()
     try:
         submission = db.execute(
             text("""
-                select id, pool_id, user_id, week_id, status, submitted_at
+                select id, pool_id, user_id, week_id, status, submitted_at, tiebreaker_prediction
                 from submissions
                 where pool_id = :pool_id
                   and week_id = :week_id
@@ -846,8 +866,8 @@ def get_submission(pool_id: str, week_id: str, user_id: str):
             {
                 "pool_id": pool_id,
                 "week_id": week_id,
-                "user_id": user_id
-            }
+                "user_id": user_id,
+            },
         ).fetchone()
 
         if not submission:
@@ -868,20 +888,22 @@ def get_submission(pool_id: str, week_id: str, user_id: str):
                 where p.submission_id = :submission_id
                 order by g.kickoff_at asc, g.away_team asc, g.home_team asc
             """),
-            {"submission_id": submission.id}
+            {"submission_id": submission.id},
         )
 
         picks = []
         for row in picks_result:
-            picks.append({
-                "id": str(row.id),
-                "game_id": str(row.game_id),
-                "selected_team": row.selected_team,
-                "confidence_value": row.confidence_value,
-                "away_team": row.away_team,
-                "home_team": row.home_team,
-                "kickoff_at": row.kickoff_at.isoformat()
-            })
+            picks.append(
+                {
+                    "id": str(row.id),
+                    "game_id": str(row.game_id),
+                    "selected_team": row.selected_team,
+                    "confidence_value": row.confidence_value,
+                    "away_team": row.away_team,
+                    "home_team": row.home_team,
+                    "kickoff_at": row.kickoff_at.isoformat(),
+                }
+            )
 
         game_count = get_game_count_for_week(db, week_id)
         allowed_values = get_allowed_confidence_values(game_count)
@@ -893,16 +915,18 @@ def get_submission(pool_id: str, week_id: str, user_id: str):
                 "user_id": str(submission.user_id),
                 "week_id": str(submission.week_id),
                 "status": submission.status,
-                "submitted_at": submission.submitted_at.isoformat() if submission.submitted_at else None
+                "submitted_at": submission.submitted_at.isoformat() if submission.submitted_at else None,
+                "tiebreaker_prediction": submission.tiebreaker_prediction,
             },
             "game_count": game_count,
             "allowed_confidence_values": allowed_values,
-            "picks": picks
+            "picks": picks,
         }
 
     finally:
         db.close()
-        
+
+
 @app.post("/submissions/{submission_id}/submit")
 def submit_submission(submission_id: str):
     db = SessionLocal()
@@ -913,22 +937,26 @@ def submit_submission(submission_id: str):
                 from submissions
                 where id = :submission_id
             """),
-            {"submission_id": submission_id}
+            {"submission_id": submission_id},
         ).fetchone()
 
         if not submission:
             raise HTTPException(status_code=404, detail="Submission not found")
 
         if submission.status == "submitted":
-            raise HTTPException(status_code=400, detail="Submission already submitted")
+            return {
+                "message": "submission already submitted",
+                "submission_id": submission_id,
+                "game_count": get_game_count_for_week(db, str(submission.week_id)),
+                "tiebreaker_prediction": submission.tiebreaker_prediction,
+            }
 
         if submission.tiebreaker_prediction is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Tiebreaker prediction is required"
-            )
+            raise HTTPException(status_code=400, detail="Tiebreaker prediction is required")
+        
+        if submission.tiebreaker_prediction < 0 or submission.tiebreaker_prediction > 200:
+            raise HTTPException(status_code=400, detail="Invalid tiebreaker value")
 
-        # Once any game in the week has started, no submission allowed
         lock_check = db.execute(
             text("""
                 select 1
@@ -937,14 +965,11 @@ def submit_submission(submission_id: str):
                   and kickoff_at <= now()
                 limit 1
             """),
-            {"week_id": submission.week_id}
+            {"week_id": submission.week_id},
         ).fetchone()
 
-        if lock_check:
-            raise HTTPException(
-                status_code=400,
-                detail="Cannot submit after games have started"
-            )
+        if lock_check and not DEV_DISABLE_LOCKS:
+            raise HTTPException(status_code=400, detail="Cannot submit after games have started")
 
         game_count = get_game_count_for_week(db, str(submission.week_id))
         allowed_values = set(get_allowed_confidence_values(game_count))
@@ -955,7 +980,7 @@ def submit_submission(submission_id: str):
                 from picks
                 where submission_id = :submission_id
             """),
-            {"submission_id": submission_id}
+            {"submission_id": submission_id},
         )
 
         picks = picks_result.fetchall()
@@ -963,7 +988,7 @@ def submit_submission(submission_id: str):
         if len(picks) != game_count:
             raise HTTPException(
                 status_code=400,
-                detail=f"Submission must contain picks for all {game_count} games"
+                detail=f"Submission must contain picks for all {game_count} games",
             )
 
         used_game_ids = {str(row.game_id) for row in picks}
@@ -974,7 +999,7 @@ def submit_submission(submission_id: str):
         if used_confidence_values != allowed_values:
             raise HTTPException(
                 status_code=400,
-                detail=f"Submission must use each confidence value exactly once: {sorted(allowed_values)}"
+                detail=f"Submission must use each confidence value exactly once: {sorted(allowed_values)}",
             )
 
         db.execute(
@@ -985,7 +1010,7 @@ def submit_submission(submission_id: str):
                     updated_at = now()
                 where id = :submission_id
             """),
-            {"submission_id": submission_id}
+            {"submission_id": submission_id},
         )
 
         db.commit()
@@ -995,7 +1020,7 @@ def submit_submission(submission_id: str):
             "submission_id": submission_id,
             "game_count": game_count,
             "confidence_values_used": sorted(list(used_confidence_values)),
-            "tiebreaker_prediction": submission.tiebreaker_prediction
+            "tiebreaker_prediction": submission.tiebreaker_prediction,
         }
 
     except HTTPException:
@@ -1005,7 +1030,8 @@ def submit_submission(submission_id: str):
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         db.close()
-        
+
+
 @app.post("/admin/pools/{pool_id}/weeks/{week_id}/score")
 def score_week(pool_id: str, week_id: str):
     db = SessionLocal()
@@ -1018,16 +1044,15 @@ def score_week(pool_id: str, week_id: str):
                   and week_id = :week_id
                   and status = 'submitted'
             """),
-            {"pool_id": pool_id, "week_id": week_id}
+            {"pool_id": pool_id, "week_id": week_id},
         ).fetchall()
 
         if not submissions:
             raise HTTPException(
                 status_code=404,
-                detail="No submitted submissions found for this pool/week"
+                detail="No submitted submissions found for this pool/week",
             )
 
-        # Find Monday Night Football game for this week
         mnf_game = db.execute(
             text("""
                 select id, home_score, away_score
@@ -1037,21 +1062,20 @@ def score_week(pool_id: str, week_id: str):
                 order by kickoff_at desc
                 limit 1
             """),
-            {"week_id": week_id}
+            {"week_id": week_id},
         ).fetchone()
 
         mnf_total = None
         if mnf_game and mnf_game.home_score is not None and mnf_game.away_score is not None:
             mnf_total = mnf_game.home_score + mnf_game.away_score
 
-        # reset existing weekly scores for this pool/week
         db.execute(
             text("""
                 delete from weekly_scores
                 where pool_id = :pool_id
                   and week_id = :week_id
             """),
-            {"pool_id": pool_id, "week_id": week_id}
+            {"pool_id": pool_id, "week_id": week_id},
         )
 
         scored_users = 0
@@ -1070,7 +1094,7 @@ def score_week(pool_id: str, week_id: str):
                     join games g on p.game_id = g.id
                     where p.submission_id = :submission_id
                 """),
-                {"submission_id": submission.id}
+                {"submission_id": submission.id},
             ).fetchall()
 
             correct_picks = 0
@@ -1085,7 +1109,7 @@ def score_week(pool_id: str, week_id: str):
                     pick.winning_team,
                     pick.is_tie,
                     pick.selected_team,
-                    pick.confidence_value
+                    pick.confidence_value,
                 )
 
                 if bucket == "correct":
@@ -1110,8 +1134,8 @@ def score_week(pool_id: str, week_id: str):
                     {
                         "pick_id": pick.pick_id,
                         "is_correct": is_correct,
-                        "points_awarded": points_awarded
-                    }
+                        "points_awarded": points_awarded,
+                    },
                 )
 
             db.execute(
@@ -1145,13 +1169,12 @@ def score_week(pool_id: str, week_id: str):
                     "incorrect_picks": incorrect_picks,
                     "pushed_picks": pushed_picks,
                     "voided_picks": voided_picks,
-                    "total_points": total_points
-                }
+                    "total_points": total_points,
+                },
             )
 
             scored_users += 1
 
-        # assign weekly ranks, using MNF tiebreaker if available
         if mnf_total is not None:
             weekly_rows = db.execute(
                 text("""
@@ -1178,8 +1201,8 @@ def score_week(pool_id: str, week_id: str):
                 {
                     "pool_id": pool_id,
                     "week_id": week_id,
-                    "mnf_total": mnf_total
-                }
+                    "mnf_total": mnf_total,
+                },
             ).fetchall()
         else:
             weekly_rows = db.execute(
@@ -1205,8 +1228,8 @@ def score_week(pool_id: str, week_id: str):
                 """),
                 {
                     "pool_id": pool_id,
-                    "week_id": week_id
-                }
+                    "week_id": week_id,
+                },
             ).fetchall()
 
         for idx, row in enumerate(weekly_rows, start=1):
@@ -1217,7 +1240,7 @@ def score_week(pool_id: str, week_id: str):
                         updated_at = now()
                     where id = :id
                 """),
-                {"rank": idx, "id": row.id}
+                {"rank": idx, "id": row.id},
             )
 
         rebuild_season_standings(db, pool_id)
@@ -1229,7 +1252,7 @@ def score_week(pool_id: str, week_id: str):
             "pool_id": pool_id,
             "week_id": week_id,
             "users_scored": scored_users,
-            "mnf_total": mnf_total
+            "mnf_total": mnf_total,
         }
 
     except HTTPException:
@@ -1239,7 +1262,8 @@ def score_week(pool_id: str, week_id: str):
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         db.close()
-        
+
+
 @app.get("/pools/{pool_id}/weeks/{week_id}/leaderboard")
 def get_weekly_leaderboard(pool_id: str, week_id: str):
     db = SessionLocal()
@@ -1253,7 +1277,7 @@ def get_weekly_leaderboard(pool_id: str, week_id: str):
                 order by kickoff_at desc
                 limit 1
             """),
-            {"week_id": week_id}
+            {"week_id": week_id},
         ).fetchone()
 
         mnf_total = None
@@ -1287,8 +1311,8 @@ def get_weekly_leaderboard(pool_id: str, week_id: str):
                 {
                     "pool_id": pool_id,
                     "week_id": week_id,
-                    "mnf_total": mnf_total
-                }
+                    "mnf_total": mnf_total,
+                },
             ).fetchall()
         else:
             rows = db.execute(
@@ -1316,8 +1340,8 @@ def get_weekly_leaderboard(pool_id: str, week_id: str):
                 """),
                 {
                     "pool_id": pool_id,
-                    "week_id": week_id
-                }
+                    "week_id": week_id,
+                },
             ).fetchall()
 
         return {
@@ -1334,15 +1358,16 @@ def get_weekly_leaderboard(pool_id: str, week_id: str):
                     "pushed_picks": row.pushed_picks,
                     "voided_picks": row.voided_picks,
                     "tiebreaker_prediction": row.tiebreaker_prediction,
-                    "tiebreak_diff": row.tiebreak_diff
+                    "tiebreak_diff": row.tiebreak_diff,
                 }
                 for row in rows
-            ]
+            ],
         }
 
     finally:
         db.close()
-        
+
+
 @app.get("/pools/{pool_id}/standings")
 def get_season_standings(pool_id: str):
     db = SessionLocal()
@@ -1364,7 +1389,7 @@ def get_season_standings(pool_id: str):
                 where ss.pool_id = :pool_id
                 order by ss.current_rank asc, u.display_name asc
             """),
-            {"pool_id": pool_id}
+            {"pool_id": pool_id},
         ).fetchall()
 
         return [
@@ -1378,85 +1403,37 @@ def get_season_standings(pool_id: str):
                 "total_incorrect_picks": row.total_incorrect_picks,
                 "total_pushed_picks": row.total_pushed_picks,
                 "total_voided_picks": row.total_voided_picks,
-                "highest_single_week_score": row.highest_single_week_score
+                "highest_single_week_score": row.highest_single_week_score,
             }
             for row in rows
         ]
 
     finally:
         db.close()
-        
-@app.post("/submissions/{submission_id}/tiebreaker")
-def set_tiebreaker(submission_id: str, prediction: int):
-    db = SessionLocal()
-    try:
-        submission = db.execute(
-            text("""
-                select id, status
-                from submissions
-                where id = :submission_id
-            """),
-            {"submission_id": submission_id}
-        ).fetchone()
 
-        if not submission:
-            raise HTTPException(status_code=404, detail="Submission not found")
-
-        if submission.status == "submitted":
-            raise HTTPException(status_code=400, detail="Submission already submitted")
-
-        db.execute(
-            text("""
-                update submissions
-                set tiebreaker_prediction = :prediction,
-                    updated_at = now()
-                where id = :submission_id
-            """),
-            {
-                "submission_id": submission_id,
-                "prediction": prediction
-            }
-        )
-
-        db.commit()
-
-        return {
-            "message": "tiebreaker set",
-            "submission_id": submission_id,
-            "prediction": prediction
-        }
-
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        db.close()
-        
 @app.get("/pools/{pool_id}/weeks/{week_id}/games")
-def get_pool_week_games(pool_id: str, week_id: str, user_id: str | None = None):
+def get_pool_week_games(pool_id: str, week_id: str, user_id: Optional[str] = None):
     db = SessionLocal()
     try:
-        # validate pool exists
         pool = db.execute(
             text("""
                 select id, name, season_year
                 from pools
                 where id = :pool_id
             """),
-            {"pool_id": pool_id}
+            {"pool_id": pool_id},
         ).fetchone()
 
         if not pool:
             raise HTTPException(status_code=404, detail="Pool not found")
 
-        # validate week exists
         week = db.execute(
             text("""
                 select id, season_year, week_number, week_type
                 from weeks
                 where id = :week_id
             """),
-            {"week_id": week_id}
+            {"week_id": week_id},
         ).fetchone()
 
         if not week:
@@ -1464,12 +1441,13 @@ def get_pool_week_games(pool_id: str, week_id: str, user_id: str | None = None):
 
         submission_id = None
         submission_status = None
+        submission_tiebreaker = None
         picks_by_game_id = {}
 
         if user_id:
             submission = db.execute(
                 text("""
-                    select id, status
+                    select id, status, tiebreaker_prediction
                     from submissions
                     where pool_id = :pool_id
                       and week_id = :week_id
@@ -1478,12 +1456,14 @@ def get_pool_week_games(pool_id: str, week_id: str, user_id: str | None = None):
                 {
                     "pool_id": pool_id,
                     "week_id": week_id,
-                    "user_id": user_id
-                }
+                    "user_id": user_id,
+                },
             ).fetchone()
 
             if submission:
                 submission_id = str(submission.id)
+                submission_status = submission.status
+                submission_tiebreaker = submission.tiebreaker_prediction
 
                 picks = db.execute(
                     text("""
@@ -1491,13 +1471,13 @@ def get_pool_week_games(pool_id: str, week_id: str, user_id: str | None = None):
                         from picks
                         where submission_id = :submission_id
                     """),
-                    {"submission_id": submission.id}
+                    {"submission_id": submission.id},
                 ).fetchall()
 
                 picks_by_game_id = {
                     str(row.game_id): {
                         "selected_team": row.selected_team,
-                        "confidence_value": row.confidence_value
+                        "confidence_value": row.confidence_value,
                     }
                     for row in picks
                 }
@@ -1518,7 +1498,7 @@ def get_pool_week_games(pool_id: str, week_id: str, user_id: str | None = None):
                 where week_id = :week_id
                 order by kickoff_at asc, away_team asc, home_team asc
             """),
-            {"week_id": week_id}
+            {"week_id": week_id},
         ).fetchall()
 
         response_games = []
@@ -1526,20 +1506,22 @@ def get_pool_week_games(pool_id: str, week_id: str, user_id: str | None = None):
             game_id = str(game.id)
             existing_pick = picks_by_game_id.get(game_id)
 
-            response_games.append({
-                "game_id": game_id,
-                "away_team": game.away_team,
-                "home_team": game.home_team,
-                "kickoff_at": game.kickoff_at.isoformat() if game.kickoff_at else None,
-                "status": game.status,
-                "away_score": game.away_score,
-                "home_score": game.home_score,
-                "winning_team": game.winning_team,
-                "is_tie": game.is_tie,
-                "is_locked": is_game_locked(db, game_id),
-                "selected_team": existing_pick["selected_team"] if existing_pick else None,
-                "confidence_value": existing_pick["confidence_value"] if existing_pick else None
-            })
+            response_games.append(
+                {
+                    "game_id": game_id,
+                    "away_team": game.away_team,
+                    "home_team": game.home_team,
+                    "kickoff_at": game.kickoff_at.isoformat() if game.kickoff_at else None,
+                    "status": game.status,
+                    "away_score": game.away_score,
+                    "home_score": game.home_score,
+                    "winning_team": game.winning_team,
+                    "is_tie": game.is_tie,
+                    "is_locked": is_game_locked(db, game_id),
+                    "selected_team": existing_pick["selected_team"] if existing_pick else None,
+                    "confidence_value": existing_pick["confidence_value"] if existing_pick else None,
+                }
+            )
 
         game_count = len(response_games)
         allowed_confidence_values = get_allowed_confidence_values(game_count)
@@ -1548,20 +1530,90 @@ def get_pool_week_games(pool_id: str, week_id: str, user_id: str | None = None):
             "pool": {
                 "id": str(pool.id),
                 "name": pool.name,
-                "season_year": pool.season_year
+                "season_year": pool.season_year,
             },
             "week": {
                 "id": str(week.id),
                 "season_year": week.season_year,
                 "week_number": week.week_number,
-                "week_type": week.week_type
+                "week_type": week.week_type,
             },
             "submission_id": submission_id,
             "submission_status": submission_status,
+            "tiebreaker_prediction": submission_tiebreaker,
             "game_count": game_count,
             "allowed_confidence_values": allowed_confidence_values,
-            "games": response_games
+            "games": response_games,
         }
 
+    finally:
+        db.close()
+        
+@app.post("/submissions/{submission_id}/tiebreaker")
+def set_tiebreaker(submission_id: str, payload: TiebreakerPayload):
+    db = SessionLocal()
+    try:
+        submission = db.execute(
+            text(
+                """
+                select id, week_id, status
+                from submissions
+                where id = :submission_id
+            """
+            ),
+            {"submission_id": submission_id},
+        ).fetchone()
+
+        if not submission:
+            raise HTTPException(status_code=404, detail="Submission not found")
+
+        if submission.status == "submitted" and not DEV_DISABLE_LOCKS:
+            raise HTTPException(status_code=400, detail="Submission already submitted")
+
+        # Match submit behavior: no changes once any game has started for that week.
+        lock_check = db.execute(
+            text(
+                """
+                select 1
+                from games
+                where week_id = :week_id
+                  and kickoff_at <= now()
+                limit 1
+            """
+            ),
+            {"week_id": submission.week_id},
+        ).fetchone()
+
+        if lock_check and not DEV_DISABLE_LOCKS:
+            raise HTTPException(status_code=400, detail="Cannot set tiebreaker after games have started")
+
+        db.execute(
+            text(
+                """
+                update submissions
+                set tiebreaker_prediction = :prediction,
+                    updated_at = now()
+                where id = :submission_id
+            """
+            ),
+            {
+                "submission_id": submission_id,
+                "prediction": payload.tiebreaker_prediction,
+            },
+        )
+
+        db.commit()
+
+        return {
+            "message": "tiebreaker set",
+            "submission_id": submission_id,
+            "prediction": payload.tiebreaker_prediction,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
     finally:
         db.close()
